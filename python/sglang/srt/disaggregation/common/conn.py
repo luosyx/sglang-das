@@ -140,6 +140,32 @@ class KVTransferError(Exception):
         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
 
 
+def validate_pd_dcp_prefill_topology(
+    *,
+    decode_dcp_size: int,
+    decode_is_mla: bool,
+    prefill_attn_cp_size: int,
+    prefill_all_cp_ranks_transfer: bool,
+    prefill_dsa_cache_layer_split: bool,
+) -> None:
+    """Validate the transfer fan-in required by a DCP decode peer."""
+    if decode_dcp_size <= 1:
+        return
+    if not decode_is_mla:
+        raise RuntimeError("PD decode DCP requires an MLA or hybrid-MLA KV pool.")
+    if (
+        prefill_attn_cp_size > 1
+        and not prefill_all_cp_ranks_transfer
+        and not prefill_dsa_cache_layer_split
+    ):
+        raise RuntimeError(
+            "PD decode DCP with prefill attention CP>1 requires every "
+            "prefill CP rank to participate in KV transfer; set "
+            "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1 on P and D. "
+            f"Got prefill attention CP={prefill_attn_cp_size}."
+        )
+
+
 @dataclasses.dataclass
 class PrefillServerInfo:
     # Topology fields (fetched from bootstrap server)
@@ -152,6 +178,7 @@ class PrefillServerInfo:
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
     kv_cache_layout: Optional[str] = None
+    enable_all_cp_ranks_for_transfer: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -181,6 +208,9 @@ class PrefillServerInfo:
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
+        self.enable_all_cp_ranks_for_transfer = bool(
+            self.enable_all_cp_ranks_for_transfer
+        )
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
@@ -760,16 +790,13 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
-        if self.dcp_size > 1:
-            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
-                raise RuntimeError(
-                    "PD decode DCP requires an MLA or hybrid-MLA KV pool."
-                )
-            if info.attn_cp_size != 1:
-                raise RuntimeError(
-                    "PD decode DCP currently requires prefill attention CP=1, "
-                    f"got {info.attn_cp_size}."
-                )
+        validate_pd_dcp_prefill_topology(
+            decode_dcp_size=self.dcp_size,
+            decode_is_mla=self.is_mla_backend or self.is_hybrid_mla_backend,
+            prefill_attn_cp_size=info.attn_cp_size,
+            prefill_all_cp_ranks_transfer=info.enable_all_cp_ranks_for_transfer,
+            prefill_dsa_cache_layer_split=info.enable_dsa_cache_layer_split,
+        )
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
@@ -924,6 +951,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "enable_all_cp_ranks_for_transfer": self.enable_all_cp_ranks_for_transfer,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -2061,6 +2089,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_layout: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.enable_all_cp_ranks_for_transfer: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -2166,6 +2195,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 data.get("enable_dsa_cache_layer_split", False)
             )
 
+        if self.enable_all_cp_ranks_for_transfer is None:
+            self.enable_all_cp_ranks_for_transfer = bool(
+                data.get("enable_all_cp_ranks_for_transfer", False)
+            )
+
         if system_dp_size == 1:
             dp_group = attn_dp_rank
         else:
@@ -2231,6 +2265,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                enable_all_cp_ranks_for_transfer=bool(
+                    self.enable_all_cp_ranks_for_transfer
+                ),
                 prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
