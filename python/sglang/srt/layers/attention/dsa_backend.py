@@ -132,7 +132,6 @@ def _validate_dsa_dcp_launch(
     enable_symm_mem: bool,
     speculative_algorithm: Optional[str],
     fused_topk_enabled: bool,
-    decode_cuda_graph_disabled: bool,
     dcp_comm_backend: str,
 ) -> None:
     """Reject DSA-DCP combinations outside the validated first phase."""
@@ -176,10 +175,6 @@ def _validate_dsa_dcp_launch(
         raise ValueError(
             "DSA DCP does not support fused DSA top-k in the first phase; set "
             "SGLANG_DSA_FUSE_TOPK=false."
-        )
-    if not decode_cuda_graph_disabled:
-        raise ValueError(
-            "DSA DCP requires decode CUDA Graph to be disabled in the first phase."
         )
     if dcp_comm_backend != "ag_rs":
         raise ValueError(
@@ -502,17 +497,6 @@ class DeepseekSparseAttnBackend(
         self.dcp_enabled = parallel.dcp_enabled
         self.dcp_size = parallel.attn_dcp_size if self.dcp_enabled else 1
         self.dcp_rank = parallel.attn_dcp_rank if self.dcp_enabled else 0
-        decode_graph_config = getattr(
-            getattr(model_runner.server_args, "cuda_graph_config", None),
-            "decode",
-            None,
-        )
-        decode_graph_backend = getattr(decode_graph_config, "backend", None)
-        decode_cuda_graph_disabled = bool(
-            model_runner.server_args.disable_cuda_graph
-            or model_runner.server_args.disable_decode_cuda_graph
-            or getattr(decode_graph_backend, "value", decode_graph_backend) == "disabled"
-        )
         _validate_dsa_dcp_launch(
             dcp_enabled=self.dcp_enabled,
             dcp_size=self.dcp_size,
@@ -528,7 +512,6 @@ class DeepseekSparseAttnBackend(
             enable_symm_mem=model_runner.server_args.enable_symm_mem,
             speculative_algorithm=model_runner.server_args.speculative_algorithm,
             fused_topk_enabled=envs.SGLANG_DSA_FUSE_TOPK.get(),
-            decode_cuda_graph_disabled=decode_cuda_graph_disabled,
             dcp_comm_backend=parallel.dcp_comm_backend,
         )
         if self.dcp_enabled:
