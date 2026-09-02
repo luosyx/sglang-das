@@ -55,8 +55,12 @@ from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
     is_float4_e2m1fn_x2,
+    is_hcu,
+    is_hcu_native_fp8_supported,
     spec_decode_alloc_len_per_request,
 )
+
+_is_hcu = is_hcu()
 
 
 @dataclass
@@ -88,6 +92,18 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
+
+
+def _get_dsa_indexer_cache_token_multiplier(kvc: KVCacheConfigurator) -> int:
+    """Slots required per allocator-visible token for replicated index-K."""
+    memory_config = get_memory()
+    if memory_config.enable_hisparse:
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        return parse_hisparse_config(kvc.server_args).host_to_device_ratio
+
+    parallel = get_parallel()
+    return parallel.attn_dcp_size if parallel.dcp_enabled else 1
 
 
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
@@ -386,13 +402,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc.kv_cache_dtype,
             kvc.page_size,
             index_head_dim,
+            hcu_device=_is_hcu,
+            native_fp8_supported=is_hcu_native_fp8_supported(),
         )
-        memory_config = get_memory()
-        indexer_ratio = 1
-        if memory_config.enable_hisparse:
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-            indexer_ratio = parse_hisparse_config(kvc.server_args).host_to_device_ratio
+        indexer_ratio = _get_dsa_indexer_cache_token_multiplier(kvc)
 
         from sglang.srt.mem_cache.kv_cache_configurator import (
             _should_elide_dsa_index_k,
@@ -438,7 +451,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             * num_indexer_layers
             * indexer_ratio
         )
-        workspace_bytes = index_k_workspace_bytes_per_token(cache_mode)
+        # INT8 dequant workspace and page-claim arrays are sized from the same
+        # replicated global index buffer as persistent index-K storage.
+        workspace_bytes = (
+            index_k_workspace_bytes_per_token(cache_mode) * indexer_ratio
+        )
         return math.ceil(persistent_bytes + workspace_bytes)
 
     def calculate_pool_sizes(
