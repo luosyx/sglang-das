@@ -100,6 +100,28 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
 
+
+def _remap_hcu_dcp_graph_kv_write_locs(
+    loc: torch.Tensor,
+    *,
+    dcp_size: int,
+    dcp_rank: int,
+    pool_size: int,
+    page_size: int,
+) -> torch.Tensor:
+    """Keep HCU DCP KV writes static-shaped during CUDA Graph capture."""
+    num_rows = loc.numel()
+    assert num_rows <= page_size, (
+        "HCU DCP CUDA Graph KV writes require the captured batch "
+        f"({num_rows}) not to exceed page size ({page_size})."
+    )
+    valid_mask = loc % dcp_size == dcp_rank
+    local_loc = loc // dcp_size
+    padding_loc = pool_size + torch.arange(
+        num_rows, dtype=loc.dtype, device=loc.device
+    )
+    return torch.where(valid_mask, local_loc, padding_loc)
+
 from sglang.srt.utils import get_bool_env_var
 
 _kv_layout_hcu_fa = get_bool_env_var("SGLANG_KV_LAYOUT_HCU_FA", default="true")
@@ -4292,14 +4314,30 @@ class MLATokenToKVPool(KVCache):
                 if parallel.dcp_enabled:
                     # LightOp has no DCP owner/slot parameters. Convert the
                     # widened virtual locations to this rank's local slots.
-                    valid_mask = (
-                        loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
-                    )
-                    loc = loc[valid_mask] // parallel.attn_dcp_size
-                    if loc.numel() == 0:
-                        return
-                    cache_k_nope = cache_k_nope[valid_mask]
-                    cache_k_rope = cache_k_rope[valid_mask]
+                    from sglang.srt.model_executor.runner import get_is_capture_mode
+
+                    if get_is_capture_mode():
+                        # Boolean indexing performs a dynamic nonzero/compaction,
+                        # which HCU cannot capture in a CUDA graph. Keep the
+                        # launch shape static and redirect every non-owner row to
+                        # its own reserved padding slot. MLATokenToKVPool always
+                        # allocates one extra page for padded/dummy writes.
+                        loc = _remap_hcu_dcp_graph_kv_write_locs(
+                            loc,
+                            dcp_size=parallel.attn_dcp_size,
+                            dcp_rank=parallel.attn_dcp_rank,
+                            pool_size=self.size,
+                            page_size=self.page_size,
+                        )
+                    else:
+                        valid_mask = (
+                            loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
+                        )
+                        loc = loc[valid_mask] // parallel.attn_dcp_size
+                        if loc.numel() == 0:
+                            return
+                        cache_k_nope = cache_k_nope[valid_mask]
+                        cache_k_rope = cache_k_rope[valid_mask]
 
                 op.fused_quantize_and_store_mla_kv_cache(
                     cache_k_nope,

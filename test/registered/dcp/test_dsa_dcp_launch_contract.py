@@ -22,7 +22,6 @@ def _valid_config(**overrides):
         "enable_symm_mem": False,
         "speculative_algorithm": None,
         "fused_topk_enabled": False,
-        "decode_cuda_graph_disabled": True,
         "dcp_comm_backend": "ag_rs",
     }
     config.update(overrides)
@@ -54,7 +53,6 @@ class TestDSADCPLaunchContract(unittest.TestCase):
                 enable_symm_mem=True,
                 speculative_algorithm="EAGLE",
                 fused_topk_enabled=True,
-                decode_cuda_graph_disabled=False,
                 dcp_comm_backend="a2a",
             )
         )
@@ -72,7 +70,6 @@ class TestDSADCPLaunchContract(unittest.TestCase):
             "symmetric memory": {"enable_symm_mem": True},
             "speculative decoding": {"speculative_algorithm": "EAGLE"},
             "fused DSA top-k": {"fused_topk_enabled": True},
-            "decode CUDA Graph": {"decode_cuda_graph_disabled": False},
             "ag_rs": {"dcp_comm_backend": "a2a"},
         }
         for expected, overrides in cases.items():
