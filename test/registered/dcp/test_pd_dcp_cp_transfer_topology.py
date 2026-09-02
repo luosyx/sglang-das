@@ -4,6 +4,9 @@ from sglang.srt.disaggregation.common.conn import (
     PrefillServerInfo,
     validate_pd_dcp_prefill_topology,
 )
+from sglang.srt.disaggregation.common.utils import (
+    localize_num_kv_tokens_for_page_slice,
+)
 
 
 def test_prefill_info_round_trips_all_cp_transfer_capability():
@@ -52,3 +55,49 @@ def test_pd_dcp_still_requires_mla_pool():
             prefill_all_cp_ranks_transfer=False,
             prefill_dsa_cache_layer_split=False,
         )
+
+
+@pytest.mark.parametrize(
+    ("sliced_page_start", "sliced_page_count", "expected"),
+    [
+        (8, 1, 64),
+        (9, 1, 16),
+        (10, 0, 0),
+    ],
+)
+def test_cp_page_slice_localizes_ragged_chunk_token_count(
+    sliced_page_start, sliced_page_count, expected
+):
+    assert (
+        localize_num_kv_tokens_for_page_slice(
+            80,
+            original_page_start=8,
+            sliced_page_start=sliced_page_start,
+            sliced_page_count=sliced_page_count,
+            physical_page_size=64,
+        )
+        == expected
+    )
+
+
+def test_cp_page_slice_preserves_full_pages_and_none():
+    assert (
+        localize_num_kv_tokens_for_page_slice(
+            128,
+            original_page_start=8,
+            sliced_page_start=9,
+            sliced_page_count=1,
+            physical_page_size=64,
+        )
+        == 64
+    )
+    assert (
+        localize_num_kv_tokens_for_page_slice(
+            None,
+            original_page_start=8,
+            sliced_page_start=9,
+            sliced_page_count=1,
+            physical_page_size=64,
+        )
+        is None
+    )
