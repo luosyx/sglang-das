@@ -4400,6 +4400,19 @@ class MLATokenToKVPool(KVCache):
             if _is_hcu:
                 from lightop import kvcache as op
 
+                parallel = get_parallel()
+                if parallel.dcp_enabled:
+                    # LightOp has no DCP owner/slot parameters. Convert the
+                    # widened virtual locations to this rank's local slots.
+                    valid_mask = (
+                        loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
+                    )
+                    loc = loc[valid_mask] // parallel.attn_dcp_size
+                    if loc.numel() == 0:
+                        return
+                    cache_k_nope = cache_k_nope[valid_mask]
+                    cache_k_rope = cache_k_rope[valid_mask]
+
                 op.fused_quantize_and_store_mla_kv_cache(
                     cache_k_nope,
                     cache_k_rope,
@@ -4730,7 +4743,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
             layer_id: index for index, layer_id in enumerate(self.indexer_layer_ids)
         }
         if index_buf_size is None:
-            index_buf_size = size
+            parallel = get_parallel()
+            index_buf_size = size * (
+                parallel.attn_dcp_size if parallel.dcp_enabled else 1
+            )
         self.index_buf_size = index_buf_size
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
