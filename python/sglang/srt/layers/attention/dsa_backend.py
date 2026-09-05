@@ -133,6 +133,18 @@ def _validate_dsa_dcp_launch(
     speculative_algorithm: Optional[str],
     fused_topk_enabled: bool,
     dcp_comm_backend: str,
+    speculative_num_steps: Optional[int],
+    speculative_eagle_topk: Optional[int],
+    speculative_num_draft_tokens: Optional[int],
+    pp_size: int,
+    attn_cp_size: int,
+    enable_dp_attention: bool,
+    attn_tp_size: int,
+    dcp_group_ranks: Tuple[int, ...],
+    attn_tp_group_ranks: Tuple[int, ...],
+    index_share_for_mtp_iteration: bool,
+    decode_cuda_graph_backend: str,
+    decode_cuda_graph_max_bs: Optional[int],
 ) -> None:
     """Reject DSA-DCP combinations outside the validated first phase."""
     if not dcp_enabled:
@@ -168,9 +180,62 @@ def _validate_dsa_dcp_launch(
     if enable_symm_mem:
         raise ValueError("DSA DCP does not support symmetric memory in the first phase.")
     if speculative_algorithm is not None:
-        raise ValueError(
-            "DSA DCP does not support speculative decoding in the first phase."
-        )
+        if not is_hcu_platform:
+            raise ValueError("DSA DCP speculative decoding is only supported on HCU.")
+        if speculative_algorithm != "EAGLE":
+            raise ValueError(
+                "DSA DCP speculative decoding only supports EAGLE; "
+                f"got {speculative_algorithm}."
+            )
+        speculative_parameters = {
+            "num_steps": speculative_num_steps,
+            "eagle_topk": speculative_eagle_topk,
+            "num_draft_tokens": speculative_num_draft_tokens,
+        }
+        invalid_parameters = {
+            name: value
+            for name, value in speculative_parameters.items()
+            if value is None or value <= 0
+        }
+        if invalid_parameters:
+            raise ValueError(
+                "DSA DCP EAGLE requires positive speculative parameters; "
+                f"got {invalid_parameters}."
+            )
+        if attn_tp_size != dcp_size:
+            raise ValueError(
+                "DSA DCP EAGLE requires attn_tp_size == dcp_size; got "
+                f"dcp_size={dcp_size}, attn_tp_size={attn_tp_size}."
+            )
+        if tuple(dcp_group_ranks) != tuple(attn_tp_group_ranks):
+            raise ValueError(
+                "DSA DCP EAGLE requires identical DCP and attention TP group ranks; "
+                f"got dcp={tuple(dcp_group_ranks)}, "
+                f"attn_tp={tuple(attn_tp_group_ranks)}."
+            )
+        if pp_size != 1 or attn_cp_size != 1 or not enable_dp_attention:
+            raise ValueError(
+                "DSA DCP EAGLE requires PP1, attnCP1, and DP attention; got "
+                f"pp_size={pp_size}, attn_cp_size={attn_cp_size}, "
+                f"enable_dp_attention={enable_dp_attention}."
+            )
+        if index_share_for_mtp_iteration:
+            raise ValueError(
+                "DSA DCP EAGLE does not support index_share_for_mtp_iteration "
+                "in the first phase."
+            )
+        if decode_cuda_graph_backend not in ("disabled", "full"):
+            raise ValueError(
+                "DSA DCP EAGLE only supports disabled or full decode CUDA Graph; "
+                f"got {decode_cuda_graph_backend}."
+            )
+        if decode_cuda_graph_backend == "full" and (
+            decode_cuda_graph_max_bs is None or decode_cuda_graph_max_bs <= 0
+        ):
+            raise ValueError(
+                "DSA DCP EAGLE CUDA Graph requires a positive max BS; "
+                f"got {decode_cuda_graph_max_bs}."
+            )
     if fused_topk_enabled:
         raise ValueError(
             "DSA DCP does not support fused DSA top-k in the first phase; set "
@@ -513,6 +578,30 @@ class DeepseekSparseAttnBackend(
             speculative_algorithm=model_runner.server_args.speculative_algorithm,
             fused_topk_enabled=envs.SGLANG_DSA_FUSE_TOPK.get(),
             dcp_comm_backend=parallel.dcp_comm_backend,
+            speculative_num_steps=model_runner.server_args.speculative_num_steps,
+            speculative_eagle_topk=model_runner.server_args.speculative_eagle_topk,
+            speculative_num_draft_tokens=(
+                model_runner.server_args.speculative_num_draft_tokens
+            ),
+            pp_size=model_runner.server_args.pp_size,
+            attn_cp_size=parallel.attn_cp_size,
+            enable_dp_attention=model_runner.server_args.enable_dp_attention,
+            attn_tp_size=parallel.attn_tp_size,
+            dcp_group_ranks=(
+                tuple(parallel.dcp_group.ranks) if self.dcp_enabled else ()
+            ),
+            attn_tp_group_ranks=tuple(parallel.attn_tp_group.ranks),
+            index_share_for_mtp_iteration=getattr(
+                model_runner.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            ),
+            decode_cuda_graph_backend=(
+                model_runner.server_args.cuda_graph_config.decode.backend
+            ),
+            decode_cuda_graph_max_bs=(
+                model_runner.server_args.cuda_graph_config.decode.max_bs
+            ),
         )
         if self.dcp_enabled:
             # The model gathers Q across the DCP group before FlashMLA.

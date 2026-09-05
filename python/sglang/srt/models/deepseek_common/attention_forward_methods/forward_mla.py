@@ -115,6 +115,7 @@ def is_dcp_mla_decode_phase(
     return (
         forward_batch.forward_mode.is_decode()
         or forward_batch.forward_mode.is_target_verify()
+        or (use_dsa and forward_batch.forward_mode.is_draft_extend_v2())
         or (use_dsa and forward_batch.forward_mode.is_extend_without_speculative())
     )
 

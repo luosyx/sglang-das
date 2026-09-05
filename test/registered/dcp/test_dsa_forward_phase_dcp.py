@@ -22,6 +22,26 @@ class TestDSAForwardPhaseDCP(unittest.TestCase):
         with get_parallel().override(dcp_enabled=True):
             self.assertFalse(is_dcp_mla_decode_phase(forward_batch, use_dsa=False))
 
+    def test_dsa_draft_extend_v2_uses_q_gather_and_lse_merge_contract(self):
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
+        with get_parallel().override(dcp_enabled=True):
+            self.assertTrue(is_dcp_mla_decode_phase(forward_batch, use_dsa=True))
+
+    def test_dense_draft_extend_v2_keeps_existing_contract(self):
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
+        with get_parallel().override(dcp_enabled=True):
+            self.assertFalse(is_dcp_mla_decode_phase(forward_batch, use_dsa=False))
+
+    def test_target_verify_contract_is_unchanged(self):
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+        with get_parallel().override(dcp_enabled=True):
+            self.assertTrue(is_dcp_mla_decode_phase(forward_batch, use_dsa=True))
+
+    def test_dcp_disabled_rejects_all_phases(self):
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
+        with get_parallel().override(dcp_enabled=False):
+            self.assertFalse(is_dcp_mla_decode_phase(forward_batch, use_dsa=True))
+
     def test_decode_contract_is_unchanged(self):
         forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
         with get_parallel().override(dcp_enabled=True):
