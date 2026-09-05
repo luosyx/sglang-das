@@ -43,7 +43,10 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
 )
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    compute_hcu_dcp_graph_kv_padding_capacity,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
@@ -182,6 +185,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        self._fixed_overhead_bytes = self._compute_graph_padding_overhead(
+            kvc, num_layers
+        )
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -263,6 +269,78 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=draft_cell_size,
                 )
+
+    def _compute_graph_padding_overhead(
+        self, kvc: KVCacheConfigurator, num_layers: int
+    ) -> int:
+        """Fixed MLA KV scratch charged outside allocator-visible token slots."""
+        if not (
+            _is_hcu
+            and get_parallel().dcp_enabled
+            and kvc.use_mla_backend
+            and is_deepseek_dsa(kvc.model_config.hf_config)
+            and kvc.spec_algorithm.is_eagle()
+        ):
+            return 0
+
+        graph_config = kvc.server_args.cuda_graph_config.decode
+        page_size = get_schedule().page_size
+        target_capacity = compute_hcu_dcp_graph_kv_padding_capacity(
+            pool_page_size=page_size,
+            page_size=page_size,
+            dcp_enabled=True,
+            is_hcu_platform=True,
+            speculative_algorithm=kvc.server_args.speculative_algorithm,
+            decode_cuda_graph_backend=graph_config.backend,
+            decode_cuda_graph_max_bs=graph_config.max_bs,
+            speculative_num_draft_tokens=(
+                kvc.server_args.max_speculative_num_draft_tokens
+            ),
+        )
+        if target_capacity == page_size:
+            return 0
+
+        from sglang.srt.layers.cp.utils import (
+            get_glm_dsa_layer_split_effective_num_layers,
+        )
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            calculate_mla_kv_cache_dim,
+        )
+
+        row_bytes = calculate_mla_kv_cache_dim(
+            model_config=kvc.model_config,
+            kv_cache_dtype=kvc.kv_cache_dtype,
+            server_args=kvc.server_args,
+        ) * torch._utils._element_size(kvc.kv_cache_dtype)
+        target_layers = get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
+        overhead = target_capacity * target_layers * row_bytes
+
+        draft_layers = int(kvc.spec_aux_config.eagle_draft_num_layers or 0)
+        draft_capacity = 0
+        if not kvc.is_draft_worker and draft_layers > 0:
+            draft_page_size = page_size * get_parallel().attn_dcp_size
+            draft_capacity = compute_hcu_dcp_graph_kv_padding_capacity(
+                pool_page_size=draft_page_size,
+                page_size=page_size,
+                dcp_enabled=True,
+                is_hcu_platform=True,
+                speculative_algorithm=kvc.server_args.speculative_algorithm,
+                decode_cuda_graph_backend=graph_config.backend,
+                decode_cuda_graph_max_bs=graph_config.max_bs,
+                speculative_num_draft_tokens=(
+                    kvc.server_args.max_speculative_num_draft_tokens
+                ),
+            )
+            overhead += draft_capacity * draft_layers * row_bytes
+
+        logger.info(
+            "HCU DCP graph KV padding overhead: target_rows=%d, "
+            "draft_rows=%d, bytes=%d",
+            target_capacity,
+            draft_capacity,
+            overhead,
+        )
+        return overhead
 
     def _compute_cell_size(
         self,
@@ -493,7 +571,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        available_bytes = max(available_bytes, 0)
+        available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
