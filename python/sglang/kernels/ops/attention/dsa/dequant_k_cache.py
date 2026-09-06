@@ -9,6 +9,97 @@ def dequantize_k_cache(quant_k_cache):
     return _dequantize_k_cache_fast_wrapped(quant_k_cache)
 
 
+def gather_dequantize_k_cache(
+    quant_k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    out: torch.Tensor,
+    compact_indices: torch.Tensor,
+) -> None:
+    """Gather Spark's 656-byte KV rows into reusable BF16 sparse MLA inputs.
+
+    Each query owns ``topk`` contiguous rows. Invalid source indices become
+    zero KV rows and -1 compact indices, including holes inside a valid prefix.
+    """
+    assert quant_k_cache.dtype == torch.float8_e4m3fn
+    assert quant_k_cache.shape[-1] == 656 and quant_k_cache.is_contiguous()
+    assert indices.ndim == 2 and indices.dtype == torch.int32
+    num_queries, topk = indices.shape
+    assert out.shape == (num_queries, topk, 1, 576)
+    assert out.dtype == torch.bfloat16 and out.is_contiguous()
+    assert compact_indices.shape == (num_queries, 1, topk)
+    assert compact_indices.dtype == torch.int32 and compact_indices.is_contiguous()
+    if num_queries == 0:
+        return
+    cache = quant_k_cache.view(-1, 656)
+    _gather_dequantize_k_cache_kernel[(num_queries, triton.cdiv(topk, 4))](
+        cache,
+        cache[:, 512:528].view(torch.float32),
+        cache[:, 528:].view(torch.bfloat16),
+        indices,
+        out,
+        compact_indices,
+        indices.stride(0),
+        indices.stride(1),
+        cache.shape[0],
+        TOPK=topk,
+        BLOCK_TOKENS=4,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _gather_dequantize_k_cache_kernel(
+    nope_ptr,
+    scale_ptr,
+    rope_ptr,
+    indices_ptr,
+    out_ptr,
+    compact_ptr,
+    index_stride_row: tl.constexpr,
+    index_stride_col: tl.constexpr,
+    cache_tokens,
+    TOPK: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    query = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    loc = tl.load(
+        indices_ptr + query * index_stride_row + cols * index_stride_col,
+        mask=cols < TOPK,
+        other=-1,
+    ).to(tl.int64)
+    valid = (cols < TOPK) & (loc >= 0) & (loc < cache_tokens)
+    dst = (query * TOPK + cols).to(tl.int64)
+    dims = tl.arange(0, 512)
+    nope = tl.load(
+        nope_ptr + loc[:, None] * 656 + dims[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    scale = tl.load(
+        scale_ptr + loc[:, None] * 164 + dims[None, :] // 128,
+        mask=valid[:, None],
+        other=0.0,
+    )
+    tl.store(
+        out_ptr + dst[:, None] * 576 + dims[None, :],
+        nope * scale,
+        mask=(cols < TOPK)[:, None],
+    )
+    rope_dims = tl.arange(0, 64)
+    rope = tl.load(
+        rope_ptr + loc[:, None] * 328 + rope_dims[None, :],
+        mask=valid[:, None],
+        other=0.0,
+    )
+    tl.store(
+        out_ptr + dst[:, None] * 576 + 512 + rope_dims[None, :],
+        rope,
+        mask=(cols < TOPK)[:, None],
+    )
+    tl.store(compact_ptr + dst, tl.where(valid, dst, -1), mask=cols < TOPK)
+
+
 def _dequantize_k_cache_ref(
     quant_k_cache: torch.Tensor,  # (num_blocks, block_size, 1, bytes_per_token)
     dv: int = 512,
