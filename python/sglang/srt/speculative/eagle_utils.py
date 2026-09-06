@@ -6,7 +6,6 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
@@ -15,7 +14,6 @@ from sglang.kernels.ops.speculative.spec_tree import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
-from sglang.srt.layers.sampler import top_k_top_p_min_p_sampling_from_probs_torch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
@@ -26,7 +24,6 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
-    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -45,7 +42,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
-_is_hcu = is_hcu()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
@@ -53,15 +49,6 @@ _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
-
-lightop_top_k_top_p_sampling_from_probs = None
-if _is_hcu:
-    try:
-        from lightop.sampling import (
-            top_k_top_p_sampling_from_probs as lightop_top_k_top_p_sampling_from_probs,
-        )
-    except (ImportError, AttributeError):
-        pass
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
@@ -72,60 +59,6 @@ elif _is_cpu:
         build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
     )
     from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
-
-
-def sample_mtp_target_ids(
-    next_token_logits: torch.Tensor,
-    sampling_info: SamplingBatchInfo,
-    draft_token_num: int,
-    positions: torch.Tensor,
-) -> torch.Tensor:
-    """Sample linear MTP target tokens on HCU before tree verification."""
-    expanded_temperature = torch.repeat_interleave(
-        sampling_info.temperatures, draft_token_num, dim=0
-    )
-    target_probs = F.softmax(next_token_logits / expanded_temperature, dim=-1)
-    expanded_top_ks = torch.repeat_interleave(
-        sampling_info.top_ks, draft_token_num, dim=0
-    )
-    expanded_top_ps = torch.repeat_interleave(
-        sampling_info.top_ps, draft_token_num, dim=0
-    )
-
-    # LightOp implements the common top-k-first/top-p path. Keep the PyTorch
-    # path for min-p and request-specific seeds.
-    if (
-        lightop_top_k_top_p_sampling_from_probs is None
-        or sampling_info.sampling_seed is not None
-        or sampling_info.need_min_p_sampling
-    ):
-        expanded_min_ps = torch.repeat_interleave(
-            sampling_info.min_ps, draft_token_num, dim=0
-        )
-        expanded_sampling_seed = (
-            None
-            if sampling_info.sampling_seed is None
-            else torch.repeat_interleave(
-                sampling_info.sampling_seed, draft_token_num, dim=0
-            )
-        )
-        return top_k_top_p_min_p_sampling_from_probs_torch(
-            target_probs,
-            expanded_top_ks,
-            expanded_top_ps,
-            expanded_min_ps,
-            sampling_info.need_min_p_sampling,
-            expanded_sampling_seed,
-            positions,
-        ).to(torch.long)
-
-    return lightop_top_k_top_p_sampling_from_probs(
-        target_probs.contiguous(),
-        expanded_top_ks,
-        expanded_top_ps,
-        filter_apply_order="top_k_first",
-        deterministic=True,
-    ).to(torch.long)
 
 
 def per_step_draft_out_cache_loc(
@@ -756,6 +689,8 @@ def eagle_sample(
 
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
+    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
+
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
     if sampling_info.acc_additive_penalties is not None:
@@ -773,6 +708,12 @@ def eagle_sample(
                 sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
             ),
         )
+    if _is_hip and verify_input.tree_topk == 1:
+        from sglang.srt.speculative.eagle_torch_sampling import apply_top1_prefix_penalties
+
+        apply_top1_prefix_penalties(
+            next_token_logits, candidates, sampling_info, verify_input.draft_token_num
+        )
     if sampling_info.logit_bias is not None:
         next_token_logits.add_(
             torch.repeat_interleave(
@@ -784,7 +725,6 @@ def eagle_sample(
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
-    candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
     accept_index = torch.full(
@@ -792,33 +732,29 @@ def eagle_sample(
     )
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
-    # Sample tokens. HCU has no target-only tree-sampling kernel yet, so for
-    # linear MTP sample the target rows before reusing the greedy tree walk.
-    # This mirrors the target-only kernel's output for topk=1 while retaining
-    # the existing TP rank-0 broadcast below.
-    sampled_target_ids = None
-    if not sampling_info.is_all_greedy and _is_hcu and verify_input.tree_topk == 1:
-        sampled_target_ids = sample_mtp_target_ids(
-            next_token_logits,
-            sampling_info,
-            verify_input.draft_token_num,
-            verify_input.positions,
-        )
-
     target_predict = None
-    if (
-        sampling_info.is_all_greedy
-        or _is_cpu
-        or _is_npu
-        or (_is_hip and not _is_hcu)
-        or _is_xpu
-        or sampled_target_ids is not None
-    ):
-        target_predict = (
-            torch.argmax(next_token_logits, dim=-1)
-            if sampled_target_ids is None
-            else sampled_target_ids
-        )
+    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+        if _is_hip and not sampling_info.is_all_greedy:
+            from sglang.srt.speculative.eagle_torch_sampling import sample_target_ids
+
+            if verify_input.tree_topk != 1 or get_spec().speculative_use_rejection_sampling:
+                raise ValueError('HIP Torch target sampling currently requires topk=1 deterministic draft')
+            n = verify_input.draft_token_num
+            positions = (batch.seq_lens[:, None] + torch.arange(n, device=device)).reshape(-1)
+            target_predict = sample_target_ids(
+                next_token_logits,
+                sampling_info.temperatures.repeat_interleave(n, dim=0),
+                sampling_info.top_ks.repeat_interleave(n),
+                sampling_info.top_ps.repeat_interleave(n),
+                sampling_info.min_ps.repeat_interleave(n),
+                sampling_info.sampling_seed.repeat_interleave(n)
+                if sampling_info.sampling_seed is not None else None,
+                positions,
+            )
+        else:
+            target_predict = torch.argmax(
+                next_token_logits.float() if _is_hip else next_token_logits, dim=-1
+            )
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
