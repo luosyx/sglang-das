@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
-    gather_dequantize_k_cache,
     gather_dequant_requant_fp8_paged,
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
@@ -493,24 +492,48 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
-        self.flashmla_bf16 = envs.SGLANG_DSA_HCU_FLASHMLA_BF16.get()
-        # Keep every captured allocation alive: CUDA graphs retain its address.
-        self._flashmla_bf16_workspaces = {}
-        if self.flashmla_bf16:
-            if not (
-                _is_hcu
-                and self.dsa_kv_cache_store_fp8
-                and self.kv_cache_dim == 656
-                and self.real_page_size == 64
-                and self.dsa_decode_impl == "flashmla_kv"
-                and not model_runner.server_args.enable_two_batch_overlap
-            ):
-                raise ValueError(
-                    "SGLANG_DSA_HCU_FLASHMLA_BF16 requires HCU, flashmla_kv "
-                    "decode, page size 64, the 656-byte FP8 KV layout and TBO off."
+        self._lightop_decode_gather = None
+        self._lightop_decode_gather_workspace: Optional[torch.Tensor] = None
+        self._lightop_decode_compact_indices: Optional[torch.Tensor] = None
+        self._lightop_decode_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        self._lightop_decode_gather_width = self.dsa_index_topk
+        lightop_decode_requested = envs.SGLANG_DSA_HCU_USE_BF16_FLASH_MLA.get()
+        lightop_decode_static_compatible = (
+            _is_hcu
+            and self.dsa_decode_impl == "flashmla_kv"
+            and self.dsa_kv_cache_store_fp8
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and self.kv_cache_dim == 656
+            and self.dsa_index_topk == 2048
+            and self.real_page_size == 64
+        )
+        if lightop_decode_requested:
+            if not lightop_decode_static_compatible:
+                raise RuntimeError(
+                    "SGLANG_DSA_HCU_USE_BF16_FLASH_MLA requires HCU DSA "
+                    "flashmla_kv with packed FP8 main KV (rank=512, rope=64, "
+                    "topk=2048, page_size=64)"
+                )
+            try:
+                from lightop import op as lightop_op
+
+                self._lightop_decode_gather = getattr(
+                    lightop_op, "decode_gather_and_up_convert_with_indices", None
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "SGLANG_DSA_HCU_USE_BF16_FLASH_MLA was requested, but "
+                    "LightOp could not be imported"
+                ) from exc
+            if self._lightop_decode_gather is None:
+                raise RuntimeError(
+                    "Installed LightOp does not expose "
+                    "decode_gather_and_up_convert_with_indices"
                 )
             logger.info(
-                "FlashMLA BF16 sparse compute enabled; packed FP8 KV storage unchanged."
+                "HCU DSA BF16 FlashMLA enabled: packed FP8 KV -> LightOp "
+                "gather/up-convert -> BF16 sparse FlashMLA."
             )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
@@ -1440,8 +1463,7 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
-        if self.flashmla_bf16:
-            self._get_flashmla_bf16_workspace(max_num_tokens)
+        self._allocate_lightop_decode_workspaces(max_num_tokens)
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -3168,31 +3190,45 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
-    def _get_flashmla_bf16_workspace(
-        self, num_queries: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return graph-stable buffers for selected BF16 KV and compact indices."""
-        capacity = max(self._flashmla_bf16_workspaces, default=0)
-        if num_queries > capacity or not self._flashmla_bf16_workspaces:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "FlashMLA BF16 workspace cannot grow during CUDA graph capture"
-                )
-            capacity = max(num_queries, 2 * capacity, 1)
-            self._flashmla_bf16_workspaces[capacity] = (
-                torch.empty(
-                    (capacity, self.dsa_index_topk, 1, 576),
-                    dtype=torch.bfloat16,
-                    device=self.device,
-                ),
-                torch.empty(
-                    (capacity, 1, self.dsa_index_topk),
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
+    def _allocate_lightop_decode_workspaces(self, capacity: int) -> None:
+        if self._lightop_decode_gather is None or capacity <= 0:
+            return
+        current_capacity = (
+            0
+            if self._lightop_decode_gather_workspace is None
+            else self._lightop_decode_gather_workspace.shape[0]
+        )
+        if current_capacity >= capacity:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DSA LightOp decode gather workspace must be allocated before "
+                "CUDA graph capture"
             )
-        gathered_kv, compact_indices = self._flashmla_bf16_workspaces[capacity]
-        return gathered_kv[:num_queries], compact_indices[:num_queries]
+        self._lightop_decode_gather_workspace = torch.empty(
+            (capacity, self._lightop_decode_gather_width, self._lightop_decode_head_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._lightop_decode_compact_indices = torch.empty(
+            (capacity, self._lightop_decode_gather_width),
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+    def _get_lightop_decode_workspaces(
+        self, num_tokens: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._allocate_lightop_decode_workspaces(num_tokens)
+        if (
+            self._lightop_decode_gather_workspace is None
+            or self._lightop_decode_compact_indices is None
+        ):
+            raise RuntimeError("DSA LightOp decode gather workspaces are unavailable")
+        return (
+            self._lightop_decode_gather_workspace[:num_tokens],
+            self._lightop_decode_compact_indices[:num_tokens],
+        )
 
     def _forward_flashmla_kv(
         self,
@@ -3238,6 +3274,42 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
+        forward_mode = effective_forward_mode(forward_batch)
+        is_decode_family = (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        )
+        lightop_kv_cache = None
+        if self._lightop_decode_gather is not None and kv_cache.is_contiguous():
+            if kv_cache.dtype == torch.uint8:
+                lightop_kv_cache = kv_cache
+            elif kv_cache.dtype == torch.float8_e4m3fn:
+                lightop_kv_cache = kv_cache.view(torch.uint8)
+        use_lightop_decode_gather = (
+            self._lightop_decode_gather is not None
+            and is_decode_family
+            and q_input.dtype == torch.bfloat16
+            and q_input.shape[-1] == self._lightop_decode_head_dim
+            and v_head_dim == self.kv_lora_rank
+            and lightop_kv_cache is not None
+            and lightop_kv_cache.is_contiguous()
+            and lightop_kv_cache.shape[-1] == self.kv_cache_dim
+            and indices.dtype in (torch.int32, torch.int64)
+            and indices.is_contiguous()
+            and cache_seqlens.dtype == torch.int32
+            and cache_seqlens.is_contiguous()
+        )
+        if (
+            self._lightop_decode_gather is not None
+            and is_decode_family
+            and not use_lightop_decode_gather
+        ):
+            raise RuntimeError(
+                "SGLANG_DSA_HCU_USE_BF16_FLASH_MLA runtime tensor contract "
+                "does not match the LightOp gather/up-convert path"
+            )
+
         # MLP-sync can append synthetic speculative rows. HCU FlashMLA must
         # only see the real prefix; downstream MLP-sync still needs the padded
         # output shape, so restore it after the kernel returns.
@@ -3253,7 +3325,7 @@ class DeepseekSparseAttnBackend(
             q_input = q_input[:num_valid]
             indices = indices[:num_valid]
             cache_seqlens = cache_seqlens[:num_valid]
-            if num_valid > 0:
+            if num_valid > 0 and not use_lightop_decode_gather:
                 flashmla_metadata = self._compute_flashmla_metadata(
                     cache_seqlens=cache_seqlens,
                     seq_len_q=1,
@@ -3265,23 +3337,26 @@ class DeepseekSparseAttnBackend(
             lse = torch.empty(
                 (0, target_q_heads, 1), dtype=torch.float32, device=q_input.device
             )
-        elif self.flashmla_bf16:
-            gathered_kv, compact_indices = self._get_flashmla_bf16_workspace(
+        elif use_lightop_decode_gather:
+            flash_mla_sparse_fwd = get_flashmla_op(
+                "flash_mla_sparse_fwd", is_hcu=_is_hcu
+            )
+            gathered_kv, compact_indices = self._get_lightop_decode_workspaces(
                 q_input.shape[0]
             )
-            gather_dequantize_k_cache(
-                kv_cache, indices[:, 0], gathered_kv, compact_indices
+            self._lightop_decode_gather(
+                lightop_kv_cache,
+                indices[:, 0, :],
+                gathered_kv,
+                cache_seqlens,
+                compact_indices,
             )
-            # gfx936's BF16 sparse-decode kernel only accepts d_qk=512. The
-            # sparse-prefill kernel supports GLM's full 576 dimensions and one
-            # independent query per selected-KV row.
-            o, lse = self._forward_flashmla_sparse(
-                q_all=q_input[:, 0],
-                kv_cache=gathered_kv.view(-1, 1, 576),
-                page_table_1=compact_indices[:, 0],
+            o, _, lse = flash_mla_sparse_fwd(
+                q=q_input[:, 0],
+                kv=gathered_kv.view(-1, 1, self._lightop_decode_head_dim),
+                indices=compact_indices.unsqueeze(1),
                 sm_scale=sm_scale,
-                v_head_dim=v_head_dim,
-                return_lse=True,
+                d_v=v_head_dim,
             )
             o = o.unsqueeze(1)
             lse = lse.unsqueeze(-1)

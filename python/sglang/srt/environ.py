@@ -1544,6 +1544,9 @@ class Envs:
     SGLANG_DSA_HCU_REUSE_SORTED_TOPK = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HCU_REUSE_SORTED_TOPK"
     )
+    # Decode-family only: LightOp gathers packed FP8 KV and up-converts the
+    # selected tokens before BF16 sparse FlashMLA compute.
+    SGLANG_DSA_HCU_USE_BF16_FLASH_MLA = EnvBool(False)
     # gfx936-only: page-planar INT8 K plus one FP32 scale per token.
     SGLANG_DSA_HCU_INT8_INDEX_K_CACHE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HCU_INT8_INDEX_K_CACHE"
