@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     dequantize_k_cache_paged,
+    gather_dequantize_k_cache,
     gather_dequant_requant_fp8_paged,
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
@@ -492,6 +493,25 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        self.flashmla_bf16 = envs.SGLANG_DSA_HCU_FLASHMLA_BF16.get()
+        # Keep every captured allocation alive: CUDA graphs retain its address.
+        self._flashmla_bf16_workspaces = {}
+        if self.flashmla_bf16:
+            if not (
+                _is_hcu
+                and self.dsa_kv_cache_store_fp8
+                and self.kv_cache_dim == 656
+                and self.real_page_size == 64
+                and self.dsa_decode_impl == "flashmla_kv"
+                and not model_runner.server_args.enable_two_batch_overlap
+            ):
+                raise ValueError(
+                    "SGLANG_DSA_HCU_FLASHMLA_BF16 requires HCU, flashmla_kv "
+                    "decode, page size 64, the 656-byte FP8 KV layout and TBO off."
+                )
+            logger.info(
+                "FlashMLA BF16 sparse compute enabled; packed FP8 KV storage unchanged."
+            )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -1420,6 +1440,8 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        if self.flashmla_bf16:
+            self._get_flashmla_bf16_workspace(max_num_tokens)
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
@@ -2724,7 +2746,8 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
         indices_are_sorted: bool = False,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         flash_mla_sparse_fwd = get_flashmla_op("flash_mla_sparse_fwd", is_hcu=_is_hcu)
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
@@ -2780,7 +2803,7 @@ class DeepseekSparseAttnBackend(
             )
 
         if raw_sparse_prefill_fwd is not None:
-            o, _, _ = raw_sparse_prefill_fwd(
+            o, _, lse = raw_sparse_prefill_fwd(
                 q_input,
                 kv_cache,
                 indices_input,
@@ -2790,7 +2813,7 @@ class DeepseekSparseAttnBackend(
                 topk_length,
             )
         else:
-            o, _, _ = flash_mla_sparse_fwd(
+            o, _, lse = flash_mla_sparse_fwd(
                 q=q_input,
                 kv=kv_cache,
                 indices=indices_input,
@@ -2803,6 +2826,8 @@ class DeepseekSparseAttnBackend(
         if need_padding:
             o = o[:, :num_heads, :]
 
+        if return_lse:
+            return o, lse
         return o
 
     def q8kv8_born_fp8_q_eligible(
@@ -3143,6 +3168,32 @@ class DeepseekSparseAttnBackend(
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
         )
 
+    def _get_flashmla_bf16_workspace(
+        self, num_queries: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return graph-stable buffers for selected BF16 KV and compact indices."""
+        capacity = max(self._flashmla_bf16_workspaces, default=0)
+        if num_queries > capacity or not self._flashmla_bf16_workspaces:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "FlashMLA BF16 workspace cannot grow during CUDA graph capture"
+                )
+            capacity = max(num_queries, 2 * capacity, 1)
+            self._flashmla_bf16_workspaces[capacity] = (
+                torch.empty(
+                    (capacity, self.dsa_index_topk, 1, 576),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                ),
+                torch.empty(
+                    (capacity, 1, self.dsa_index_topk),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            )
+        gathered_kv, compact_indices = self._flashmla_bf16_workspaces[capacity]
+        return gathered_kv[:num_queries], compact_indices[:num_queries]
+
     def _forward_flashmla_kv(
         self,
         q_all: torch.Tensor,
@@ -3208,11 +3259,34 @@ class DeepseekSparseAttnBackend(
                     seq_len_q=1,
                 )
 
+        lse_is_base2 = False
         if needs_repad and num_valid == 0:
             o = q_input.new_zeros((0, 1, target_q_heads, v_head_dim))
             lse = torch.empty(
                 (0, target_q_heads, 1), dtype=torch.float32, device=q_input.device
             )
+        elif self.flashmla_bf16:
+            gathered_kv, compact_indices = self._get_flashmla_bf16_workspace(
+                q_input.shape[0]
+            )
+            gather_dequantize_k_cache(
+                kv_cache, indices[:, 0], gathered_kv, compact_indices
+            )
+            # gfx936's BF16 sparse-decode kernel only accepts d_qk=512. The
+            # sparse-prefill kernel supports GLM's full 576 dimensions and one
+            # independent query per selected-KV row.
+            o, lse = self._forward_flashmla_sparse(
+                q_all=q_input[:, 0],
+                kv_cache=gathered_kv.view(-1, 1, 576),
+                page_table_1=compact_indices[:, 0],
+                sm_scale=sm_scale,
+                v_head_dim=v_head_dim,
+                return_lse=True,
+            )
+            o = o.unsqueeze(1)
+            lse = lse.unsqueeze(-1)
+            # sparse_prefill_fwd returns base-2 LSE, unlike dense FlashMLA.
+            lse_is_base2 = True
         else:
             o, lse = flash_mla_with_kvcache(
                 q=q_input,
@@ -3243,9 +3317,13 @@ class DeepseekSparseAttnBackend(
             lse = lse[:, :num_q_heads, :]
 
         if return_lse:
-            # FlashMLA exposes natural-log LSE; ag_rs consumes base-2 LSE.
+            # Dense FlashMLA exposes natural-log LSE; ag_rs consumes base-2.
+            # sparse_prefill_fwd already returns base-2 LSE.
             o = o.squeeze(1).contiguous()
-            lse = lse.squeeze(-1).to(torch.float32).mul_(_LOG2_E).contiguous()
+            lse = lse.squeeze(-1).to(torch.float32)
+            if not lse_is_base2:
+                lse = lse.mul_(_LOG2_E)
+            lse = lse.contiguous()
 
             # Owner filtering may leave a rank with no local sparse KV. Such
             # rows must be the online-softmax identity before the DCP merge.
