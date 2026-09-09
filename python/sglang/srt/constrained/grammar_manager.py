@@ -126,7 +126,17 @@ class GrammarManager:
         if thinking_budget is None:
             return
         if isinstance(req.grammar, ReasonerGrammarObject):
-            req.grammar.max_think_tokens = thinking_budget
+            # SGLANG_MAX_THINK_TOKENS is an operator safety ceiling. A request
+            # may tighten that ceiling, but must not silently raise or disable
+            # it (long evaluation budgets otherwise replace the guard).
+            server_ceiling = req.grammar.max_think_tokens
+            if server_ceiling >= 0:
+                if thinking_budget >= 0:
+                    req.grammar.max_think_tokens = min(
+                        server_ceiling, thinking_budget
+                    )
+            else:
+                req.grammar.max_think_tokens = thinking_budget
 
     def process_req_with_grammar(self, req: Req) -> bool:
         # Init grammar cache for this request
