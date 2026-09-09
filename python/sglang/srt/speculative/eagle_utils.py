@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
@@ -564,7 +565,8 @@ def eagle_prepare_for_verify(
 
     # Run attention backend plan and cuda graph preparation
     can_run_cuda_graph = bool(
-        target_worker.model_runner.decode_cuda_graph_runner
+        not envs.SGLANG_DISABLE_TARGET_VERIFY_CUDA_GRAPH.get()
+        and target_worker.model_runner.decode_cuda_graph_runner
         and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
             verify_forward_batch
         )
