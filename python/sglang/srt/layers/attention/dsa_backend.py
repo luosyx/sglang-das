@@ -495,6 +495,11 @@ class DeepseekSparseAttnBackend(
         self._lightop_decode_gather = None
         self._lightop_decode_gather_workspace: Optional[torch.Tensor] = None
         self._lightop_decode_compact_indices: Optional[torch.Tensor] = None
+        # CUDA graphs retain raw addresses. Keep every superseded allocation
+        # alive when an eager MTP phase grows the active workspace.
+        self._lightop_decode_retained_workspaces: Dict[
+            int, Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self._lightop_decode_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         self._lightop_decode_gather_width = self.dsa_index_topk
         lightop_decode_requested = envs.SGLANG_DSA_HCU_USE_BF16_FLASH_MLA.get()
@@ -3205,6 +3210,19 @@ class DeepseekSparseAttnBackend(
                 "DSA LightOp decode gather workspace must be allocated before "
                 "CUDA graph capture"
             )
+        if (
+            self._lightop_decode_gather_workspace is not None
+            and self._lightop_decode_compact_indices is not None
+        ):
+            self._lightop_decode_retained_workspaces[current_capacity] = (
+                self._lightop_decode_gather_workspace,
+                self._lightop_decode_compact_indices,
+            )
+        logger.info(
+            "Allocating LightOp decode workspace: old_capacity=%d, new_capacity=%d",
+            current_capacity,
+            capacity,
+        )
         self._lightop_decode_gather_workspace = torch.empty(
             (capacity, self._lightop_decode_gather_width, self._lightop_decode_head_dim),
             dtype=torch.bfloat16,
