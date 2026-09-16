@@ -174,6 +174,14 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
 
 def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
     """Call ``AutoTokenizer.from_pretrained`` with error handling."""
+    # AutoTokenizer internally reloads AutoConfig in tokenizer and detokenizer
+    # subprocesses, so apply the same GLM DSA compatibility used by get_config.
+    from .config import _ensure_glm_moe_dsa_layer_type_compatibility
+
+    _ensure_glm_moe_dsa_layer_type_compatibility(
+        tokenizer_name,
+        revision=common_kwargs.get("revision"),
+    )
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name, *args, **common_kwargs

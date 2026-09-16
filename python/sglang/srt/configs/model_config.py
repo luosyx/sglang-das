@@ -134,6 +134,49 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def is_glm_moe_dsa_w4a16_slimquant_compatible(hf_config, quant_config) -> bool:
+    """Return whether a packed GLM DSA W4A16 checkpoint can use W4A8 runtime."""
+    if _hf_arch(hf_config) not in (
+        "GlmMoeDsaForCausalLM",
+        "GlmMoeDsaForCausalLMNextN",
+    ):
+        return False
+    if quant_config.get("format") != "pack-quantized":
+        return False
+
+    groups = quant_config.get("config_groups") or {}
+    if not groups:
+        return False
+    for group in groups.values():
+        weight = group.get("weights") or {}
+        if group.get("input_activations") is not None:
+            return False
+        if not (
+            weight.get("type") == "int"
+            and weight.get("num_bits") == 4
+            and weight.get("strategy") == "channel"
+            and weight.get("group_size") == -1
+            and weight.get("symmetric") is True
+            and weight.get("dynamic") is False
+        ):
+            return False
+    return True
+
+
+def should_preserve_explicit_unquantized_draft(
+    *,
+    is_draft_model: bool,
+    is_draft_quantization_explicit: bool,
+    quantization: Optional[str],
+) -> bool:
+    """Keep an explicit draft ``unquant`` request after checkpoint detection."""
+    return (
+        is_draft_model
+        and is_draft_quantization_explicit
+        and quantization is None
+    )
+
+
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) == "KimiK3ForConditionalGeneration"
 
@@ -1621,14 +1664,35 @@ class ModelConfig:
                             break
 
             # Verify quantization configurations.
-            if self.quantization is None:
+            preserve_unquantized_draft = should_preserve_explicit_unquantized_draft(
+                is_draft_model=self.is_draft_model,
+                is_draft_quantization_explicit=self.is_draft_quantization_explicit,
+                quantization=self.quantization,
+            )
+            if preserve_unquantized_draft:
+                logger.info(
+                    "Keeping explicitly unquantized draft model instead of "
+                    f"checkpoint quantization: {quant_method}"
+                )
+            elif self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method
-                is_compatible = preserve_online_draft_quantization or (
+                is_glm_w4a16_slimquant_compatible = (
+                    self.quantization == "slimquant_w4a8_marlin"
+                    and quant_method in ("compressed-tensors", "compressed_tensors")
+                    and is_glm_moe_dsa_w4a16_slimquant_compatible(
+                        self.hf_config, quant_cfg
+                    )
+                )
+                is_compatible = (
+                    preserve_online_draft_quantization
+                    or is_glm_w4a16_slimquant_compatible
+                    or (
                     self.quantization in compatible_quantization_methods
                     and quant_method
                     in compatible_quantization_methods[self.quantization]
+                    )
                 )
                 if is_compatible:
                     # Keep the CLI-specified quantization (e.g., modelopt_fp4) even if

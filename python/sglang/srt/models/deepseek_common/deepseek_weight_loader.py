@@ -82,6 +82,43 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _convert_compressed_tensors_w4a16_for_slimquant(
+    name: str,
+    loaded_weight: torch.Tensor,
+) -> Tuple[Optional[str], Optional[torch.Tensor]]:
+    """Convert routed-expert W4A16 tensors to the legacy SlimQuant layout.
+
+    compressed-tensors stores eight unsigned-offset INT4 values in each int32,
+    with increasing K indices in increasing nibbles and the true channel scale.
+    SlimQuant stores two signed INT4 values per int8, with the even K value in
+    the high nibble, and its legacy LightOp kernel expects scale / 16.
+    """
+    if ".mlp.experts." not in name:
+        return name, loaded_weight
+
+    if name.endswith(".weight_shape"):
+        return None, None
+
+    if name.endswith(".weight_packed"):
+        if loaded_weight.dtype != torch.int32:
+            raise ValueError(
+                "compressed-tensors W4A16 weight_packed must be int32, "
+                f"but {name} has dtype {loaded_weight.dtype}."
+            )
+        packed_bytes = loaded_weight.contiguous().view(torch.uint8)
+        # Swap each pair so even K moves to the high nibble, then toggle the
+        # sign bit of both nibbles (unsigned offset-8 -> two's complement).
+        converted = (
+            (((packed_bytes & 0x0F) << 4) | (packed_bytes >> 4)) ^ 0x88
+        ).to(torch.int8)
+        return name.replace("weight_packed", "weight"), converted
+
+    if name.endswith(".weight_scale"):
+        return name, loaded_weight / 16.0
+
+    return name, loaded_weight
+
+
 def _get_indexer_weight_block_size(
     quant_config: Optional[QuantizationConfig],
 ) -> List[int]:
@@ -284,6 +321,18 @@ class DeepseekV2WeightLoaderMixin:
                                     >= self.config.num_hidden_layers
                                 ):
                                     continue
+
+                if (
+                    self.quant_config is not None
+                    and self.quant_config.get_name() == "slimquant_w4a8_marlin"
+                ):
+                    name, loaded_weight = (
+                        _convert_compressed_tensors_w4a16_for_slimquant(
+                            name, loaded_weight
+                        )
+                    )
+                    if name is None:
+                        continue
 
                 if "rotary_emb.inv_freq" in name:
                     continue

@@ -69,6 +69,28 @@ _GLM_MOE_DSA_ARCHS = {
 }
 
 
+def _ensure_glm_moe_dsa_layer_type_compatibility(
+    model, revision: Optional[str], **kwargs
+):
+    """Allow the GLM DSA layer type used by official GLM-5.x configs."""
+    raw_config, _ = PretrainedConfig.get_config_dict(model, revision=revision, **kwargs)
+    architectures = raw_config.get("architectures") or []
+    layer_types = raw_config.get("layer_types") or []
+    layer_type = "deepseek_sparse_attention"
+
+    if not any(arch in _GLM_MOE_DSA_ARCHS for arch in architectures):
+        return
+    if layer_type not in layer_types:
+        return
+
+    # Transformers 5 validates layer_types before SGLang can restore the raw
+    # GLM fields. Keep the model-specific value intact instead of rewriting it.
+    import transformers.configuration_utils as configuration_utils
+
+    if layer_type not in configuration_utils.ALLOWED_LAYER_TYPES:
+        configuration_utils.ALLOWED_LAYER_TYPES += (layer_type,)
+
+
 def _restore_glm_moe_dsa_raw_config_fields(
     config, model, revision: Optional[str], **kwargs
 ):
@@ -110,6 +132,9 @@ class HfModelConfigParser(ModelConfigParserBase):
     ):
         config = _try_load_longcat_config(model, revision, **kwargs)
         if config is None:
+            _ensure_glm_moe_dsa_layer_type_compatibility(
+                model, revision=revision, **kwargs
+            )
             config = AutoConfig.from_pretrained(
                 model,
                 trust_remote_code=trust_remote_code,

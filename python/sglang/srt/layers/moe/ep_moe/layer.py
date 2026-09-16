@@ -131,8 +131,14 @@ except ImportError:
 
 from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 from lightop import fuse_silu_mul_clamp_quant, moe as lightop_op
-from lightop import fuse_situ_mul_quant_contiguous  as  fuse_situ_mul_quant
-from lightop import fuse_situ_mul_quant_ep
+try:
+    from lightop import fuse_situ_mul_quant_contiguous as fuse_situ_mul_quant
+    from lightop import fuse_situ_mul_quant_ep
+except ImportError:
+    # lightop 0.6 uses the correctly spelled ``silu`` names. Keep compatibility
+    # with both the old runtime image and newer packages exposing ``situ``.
+    from lightop.activation import fuse_silu_mul_quant as fuse_situ_mul_quant
+    from lightop.activation import fuse_silu_mul_quant_ep as fuse_situ_mul_quant_ep
 from lightop.activation import (
     fuse_silu_and_mul,
     fuse_silu_mul_fp8_quant,
@@ -164,6 +170,20 @@ elif _is_npu:
     import torch_npu
 
 logger = logging.getLogger(__name__)
+
+
+def _dequantize_deepep_hidden_states(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Restore BF16/FP16 activations from DeepEP's per-token INT8 transport."""
+    hidden_states = hidden_states.to(dtype)
+    if hidden_states_scale is None:
+        return hidden_states
+    if hidden_states_scale.dim() == hidden_states.dim() - 1:
+        hidden_states_scale = hidden_states_scale.unsqueeze(-1)
+    return hidden_states * hidden_states_scale.to(dtype)
 
 
 def _can_use_lightop_ep_scatter(
@@ -984,10 +1004,15 @@ class DeepEPMoE(FusedMoE):
         dispatch_output: DeepEPLLDispatchOutput,
     ):
         hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
-        assert hidden_states_scale is None
         assert self.moe_runner_config.activation == "silu"
         assert self.moe_runner_config.is_gated
         assert hidden_states.dim() == 3
+
+        hidden_states = _dequantize_deepep_hidden_states(
+            hidden_states,
+            hidden_states_scale,
+            self.w13_weight.dtype,
+        )
 
         num_experts, max_tokens, _ = hidden_states.shape
         token_offsets = torch.arange(max_tokens, device=hidden_states.device)
