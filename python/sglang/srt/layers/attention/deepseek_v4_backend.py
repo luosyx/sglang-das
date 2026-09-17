@@ -676,7 +676,7 @@ class DeepseekV4AttnBackend(
         )
         self._dsv4_lightop_kvcache_op = None
         self._dsv4_bf16_flashmla_workspaces: Dict[
-            str, Tuple[torch.Tensor, torch.Tensor]
+            Tuple[str, int], Tuple[torch.Tensor, torch.Tensor]
         ] = {}
         if self._dsv4_lightop_bf16_gather and not self._dsv4_bf16_flashmla_decode:
             raise RuntimeError(
@@ -1763,17 +1763,11 @@ class DeepseekV4AttnBackend(
     ) -> None:
         if not self._dsv4_bf16_flashmla_decode or capacity <= 0 or topk <= 0:
             return
-        current = self._dsv4_bf16_flashmla_workspaces.get(slot)
-        if current is not None:
-            current_capacity = current[0].shape[0]
-            current_topk = current[0].shape[1]
-            if current_capacity >= capacity and current_topk == topk:
-                return
-            # Drop the previous buffer before reallocating. c128 topk grows
-            # every prefill chunk; keeping one workspace per topk OOMs on
-            # long context with small chunked_prefill_size.
-            del self._dsv4_bf16_flashmla_workspaces[slot]
-            del current
+        key = (slot, topk)
+        current = self._dsv4_bf16_flashmla_workspaces.get(key)
+        current_capacity = 0 if current is None else current[0].shape[0]
+        if current_capacity >= capacity:
+            return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "DSV4 BF16 FlashMLA gather workspace must be allocated before "
@@ -1789,7 +1783,7 @@ class DeepseekV4AttnBackend(
             dtype=torch.int32,
             device=self.device,
         )
-        self._dsv4_bf16_flashmla_workspaces[slot] = (
+        self._dsv4_bf16_flashmla_workspaces[key] = (
             gathered_kv,
             compact_indices,
         )
@@ -1801,7 +1795,7 @@ class DeepseekV4AttnBackend(
         topk: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self._allocate_dsv4_bf16_flashmla_workspace(slot, num_queries, topk)
-        workspace = self._dsv4_bf16_flashmla_workspaces.get(slot)
+        workspace = self._dsv4_bf16_flashmla_workspaces.get((slot, topk))
         if workspace is None:
             raise RuntimeError("DSV4 BF16 FlashMLA gather workspace is unavailable")
         gathered_kv, compact_indices = workspace
@@ -2510,37 +2504,19 @@ class DeepseekV4AttnBackend(
             compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
-        if envs.SGLANG_LIGHTOP_DEQUANTIZE_K_CACHE_PAGED.get():
-            from lightop.kvcache import dsv4_dequantize_k_cache_paged_out
-
-            # Match the original wrapper's byte view; keep the caller's slices.
-            if compressed_slice is not None:
-                dsv4_dequantize_k_cache_paged_out(
-                    extra_k_cache.view(torch.uint8),
-                    flat_token_ids,
-                    compressed_slice,
-                    extra_page_size,
-                )
-            dsv4_dequantize_k_cache_paged_out(
-                token_to_kv_pool.get_swa_key_buffer_radix(layer_id).view(torch.uint8),
-                cache.swa_token_ids,
-                swa_slice,
-                cache.swa_page_size,
-            )
-        else:
-            if compressed_slice is not None:
-                dequantize_k_cache_paged(
-                    extra_k_cache,
-                    flat_token_ids,
-                    page_size=extra_page_size,
-                    out=compressed_slice,
-                )
+        if compressed_slice is not None:
             dequantize_k_cache_paged(
-                token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
-                cache.swa_token_ids,
-                page_size=cache.swa_page_size,
-                out=swa_slice,
+                extra_k_cache,
+                flat_token_ids,
+                page_size=extra_page_size,
+                out=compressed_slice,
             )
+        dequantize_k_cache_paged(
+            token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
+            cache.swa_token_ids,
+            page_size=cache.swa_page_size,
+            out=swa_slice,
+        )
         kv = workspace
 
         o, _, _ = flash_mla_sparse_fwd(

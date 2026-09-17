@@ -72,16 +72,9 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hcu
-from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
-
-_is_hcu = is_hcu()
-_kv_layout_hcu_fa = _is_hcu and get_bool_env_var(
-    "SGLANG_KV_LAYOUT_HCU_FA", default="true"
-)
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
@@ -1280,70 +1273,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
         bytes_per_token_on_prefill = src_kv_item_len // page_size
         bytes_per_token_on_decode = dst_kv_item_len // page_size
-        kv_cache_layout = getattr(self, "kv_cache_layout", None)
-        if kv_cache_layout is None:
-            # Compatibility with older CommonKVManager versions that do not
-            # propagate the pool layout through KVArgs yet.
-            kv_cache_layout = "hnd" if envs.SGLANG_USE_HND_KVCACHE.get() else "nhd"
-        is_hnd = kv_cache_layout == "hnd"
-        is_hcu_legacy = (
-            _kv_layout_hcu_fa
-            and not is_hnd
-            and not envs.SGLANG_USE_HND_KVCACHE.get()
+        src_token_slot_offsets = (
+            tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
         )
-        if is_hnd:
-            # HND/BHSD pages are laid out as [page, head, token, dim]. Heads
-            # belonging to one token are therefore not contiguous: adjacent
-            # heads are page_size * head_bytes apart. Build one contiguous
-            # dim-slice per (page, head, token) instead of treating the page as
-            # token-major, which would silently corrupt asymmetric-TP KV data.
-            src_head_indices = np.arange(
-                src_head_start_offset,
-                src_head_start_offset + num_heads_to_send,
-                dtype=np.int64,
-            ).reshape(1, -1, 1)
-            dst_head_indices = np.arange(
-                dst_head_start_offset,
-                dst_head_start_offset + num_heads_to_send,
-                dtype=np.int64,
-            ).reshape(1, -1, 1)
-            token_offsets = np.arange(page_size, dtype=np.int64).reshape(1, 1, -1)
-            src_token_slot_offsets = (
-                src_head_indices * page_size + token_offsets
-            ) * bytes_per_head_slice_to_send
-            dst_token_slot_offsets = (
-                dst_head_indices * page_size + token_offsets
-            ) * bytes_per_head_slice_to_send
-            transfer_slice_len = bytes_per_head_slice_to_send
-        elif is_hcu_legacy:
-            # The legacy HCU FA cache is head-major within each page:
-            # K is [page, head, token, dim] and V is [page, head, dim, token].
-            # Although K and V differ inside a head, one whole head remains a
-            # contiguous page-sized byte range in both buffers. Transfer each
-            # selected head as one slice so asymmetric TP preserves the exact
-            # physical layout without assuming token-major NHD storage.
-            src_head_indices = np.arange(
-                src_head_start_offset,
-                src_head_start_offset + num_heads_to_send,
-                dtype=np.int64,
-            ).reshape(1, -1)
-            dst_head_indices = np.arange(
-                dst_head_start_offset,
-                dst_head_start_offset + num_heads_to_send,
-                dtype=np.int64,
-            ).reshape(1, -1)
-            head_page_bytes = page_size * bytes_per_head_slice_to_send
-            src_token_slot_offsets = src_head_indices * head_page_bytes
-            dst_token_slot_offsets = dst_head_indices * head_page_bytes
-            transfer_slice_len = head_page_bytes
-        else:
-            src_token_slot_offsets = (
-                tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
-            )
-            dst_token_slot_offsets = (
-                tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
-            )
-            transfer_slice_len = heads_bytes_per_token_to_send
+        dst_token_slot_offsets = (
+            tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
+        )
 
         def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
             src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
@@ -1357,7 +1292,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 return 0
             dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
             total_slices = len(src_addr_list)
-            length_list = [transfer_slice_len] * total_slices
+            length_list = [heads_bytes_per_token_to_send] * total_slices
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
@@ -2397,31 +2332,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     req.dst_device_kv_indices[kv_chunk.index_slice]
                                 )
 
-                            # A source/destination page-count mismatch means the
-                            # decode allocation no longer describes this prefill
-                            # chunk. Truncating either side silently accepts a
-                            # partial KV cache and can produce plausible-looking
-                            # but corrupted tokens. Fail the request before RDMA
-                            # instead; PP consensus will release both stages.
-                            src_page_count = len(kv_chunk.prefill_kv_indices)
-                            dst_page_count = len(chunked_dst_kv_indice)
-                            if src_page_count != dst_page_count:
-                                failure_reason = (
-                                    "KV page-count mismatch before Mooncake transfer: "
-                                    f"room={kv_chunk.room}, src_pages={src_page_count}, "
-                                    f"dst_pages={dst_page_count}, slice={kv_chunk.index_slice}"
+                            # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
+                            # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
+                            if len(chunked_dst_kv_indice) < len(
+                                kv_chunk.prefill_kv_indices
+                            ):
+                                logger.warning(
+                                    f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
                                 )
-                                logger.error(failure_reason)
-                                self.record_failure(kv_chunk.room, failure_reason)
-                                self.update_status(kv_chunk.room, KVPoll.Failed)
-                                self.sync_status_to_decode_endpoint(
-                                    req.endpoint,
-                                    req.dst_port,
-                                    req.room,
-                                    KVPoll.Failed,
-                                    prefill_unique_rank,
+                                kv_chunk.prefill_kv_indices = (
+                                    kv_chunk.prefill_kv_indices[
+                                        : len(chunked_dst_kv_indice)
+                                    ]
                                 )
-                                break
+                            if chunked_dst_device_kv_indice is not None:
+                                chunked_dst_device_kv_indice = (
+                                    chunked_dst_device_kv_indice[
+                                        : len(kv_chunk.prefill_kv_indices)
+                                    ]
+                                )
 
                         skip_kv, skip_state = self._get_dsa_cache_transfer_skip_flags(
                             target_rank_registration_info
@@ -2494,20 +2423,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 staging_deferred = True
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
-                        else:
-                            # Asymmetric attn TP (prefill != decode) without staging:
-                            # fall back to the per-slice path.  This is the chain's
-                            # catch-all -- without it `ret` stays unbound below.
-                            ret = self.send_kvcache_slice(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                target_rank_registration_info.dst_tp_rank,
-                                target_rank_registration_info.dst_attn_tp_size,
-                                target_rank_registration_info.dst_kv_item_len,
-                                executor,
-                            )
+                            else:
+                                ret = self.send_kvcache_slice(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    target_rank_registration_info.dst_tp_rank,
+                                    target_rank_registration_info.dst_attn_tp_size,
+                                    target_rank_registration_info.dst_kv_item_len,
+                                    executor,
+                                )
                         if ret != 0:
                             self._mark_session_failed_and_sync(
                                 kv_chunk=kv_chunk,

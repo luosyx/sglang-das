@@ -735,6 +735,7 @@ def eagle_sample(
     )
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
+    # Sample tokens
     target_predict = None
     if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
         if _is_hip and not sampling_info.is_all_greedy:
