@@ -271,6 +271,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
+    # LightOp may need another output-sized allocation, and the long-running HCU
+    # heap can be fragmented even when mem_get_info reports enough aggregate
+    # free memory. Leave half of the computed logits budget as allocator and
+    # kernel-workspace headroom instead of failing late in a 1M-token prefill.
+    _MQA_LOGITS_HCU_SAFETY_FACTOR = 0.5
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
     @staticmethod
@@ -1416,6 +1421,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         total_mem_budget = int(total_mem * self._MQA_LOGITS_TOTAL_MEM_FRACTION)
         mem_fraction_static = get_schedule().mem_fraction_static
+        safety_factor = (
+            self._MQA_LOGITS_HCU_SAFETY_FACTOR if _is_hcu else 1.0
+        )
         if mem_fraction_static is None:
             static_budget = total_mem_budget
         else:
@@ -1430,7 +1438,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # caching it. The first non-capture prefill path will cache the real
         # free-memory budget below.
         if get_is_capture_mode():
-            return static_budget
+            return max(1, int(static_budget * safety_factor))
 
         # Match the original free-memory guard: logits_bytes * 2 > free_mem.
         # torch.cuda.mem_get_info synchronizes the host, so cache the result,
@@ -1438,6 +1446,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         free_mem, _ = torch.cuda.mem_get_info(device_index)
         budget_bytes = min(int(free_mem * free_mem_fraction), static_budget)
 
+        budget_bytes = int(budget_bytes * safety_factor)
         budget_bytes = max(1, budget_bytes)
         self._mqa_logits_budget_bytes[device_index] = budget_bytes
         return budget_bytes

@@ -47,6 +47,40 @@ class TestHCUDSAPagedMQABackend(CustomTestCase):
 
 
 class TestHCUDSAIndexerLightOpContracts(CustomTestCase):
+    def test_hcu_mqa_logits_budget_keeps_fragmentation_headroom(self):
+        indexer = object.__new__(Indexer)
+        Indexer._mqa_logits_budget_bytes.clear()
+
+        with (
+            patch.object(indexer_module, "_is_hcu", True),
+            patch.object(
+                indexer_module,
+                "get_schedule",
+                return_value=SimpleNamespace(mem_fraction_static=0.75),
+            ),
+            patch.object(indexer_module, "get_is_capture_mode", return_value=False),
+            patch.object(
+                indexer_module.torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(total_memory=1000),
+            ),
+            patch.object(
+                indexer_module.torch.cuda,
+                "mem_get_info",
+                return_value=(600, 1000),
+            ),
+            patch.object(
+                Indexer, "_mqa_logits_free_mem_fraction", return_value=0.2
+            ),
+        ):
+            budget = indexer._get_mqa_logits_budget_bytes(0)
+
+        # Raw static headroom is (1 - 0.75) * 1000 * 0.2 = 50 bytes.
+        # HCU reserves half for LightOp workspace and allocator fragmentation.
+        self.assertEqual(budget, 25)
+        self.assertEqual(Indexer._mqa_logits_budget_bytes[0], 25)
+        Indexer._mqa_logits_budget_bytes.clear()
+
     def test_qk_prepare_uses_lightop_fused_layernorm_rope(self):
         indexer = object.__new__(Indexer)
         indexer.wq_b = MagicMock(return_value=(sentinel.query_projection, None))
