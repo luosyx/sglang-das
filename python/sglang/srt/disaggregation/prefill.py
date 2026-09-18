@@ -2188,7 +2188,27 @@ class SchedulerDisaggregationPrefillMixin:
                 staging_grid_tokens(get_schedule().chunked_prefill_size, page_size),
             )
         else:
-            segments = [(start_idx, end_idx)]
+            # A radix-cache hit can make the optional cached-prefix early send
+            # hundreds of times larger than the configured prefill chunk.  A
+            # single Mooncake request of that size serializes a huge page list
+            # and makes near-1M shared-prefix requests look hung.  Keep the
+            # transfer granularity bounded just like ordinary chunked prefill.
+            configured_chunk = get_schedule().chunked_prefill_size
+            transfer_chunk = (
+                max(page_size, configured_chunk - configured_chunk % page_size)
+                if configured_chunk > 0
+                else max(page_size, end_idx - start_idx)
+            )
+            segments = []
+            segment_start = start_idx
+            while segment_start < end_idx:
+                segment_end = min(segment_start + transfer_chunk, end_idx)
+                segments.append((segment_start, segment_end))
+                segment_start = segment_end
+            # Preserve the terminal zero-page send used when decode already
+            # owns the whole prefix; it carries aux/state and concludes status.
+            if not segments:
+                segments = [(start_idx, end_idx)]
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
