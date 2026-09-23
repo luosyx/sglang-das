@@ -1003,12 +1003,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         layer_id: int,
     ) -> torch.Tensor:
         """Return the packed INT8 K+scale pages for native LightOp MQA."""
+        index_page_size = getattr(pool, "index_page_size", pool.page_size)
         packed_cache = self._get_index_k_read_buffer(pool, layer_id)
         assert packed_cache.dtype == torch.uint8
         assert packed_cache.dim() == 2
-        assert packed_cache.shape[1] == pool.page_size * (self.head_dim + 4)
+        assert packed_cache.shape[1] == index_page_size * (self.head_dim + 4)
         return packed_cache.view(torch.int8).view(
-            packed_cache.shape[0], pool.page_size, 1, self.head_dim + 4
+            packed_cache.shape[0], index_page_size, 1, self.head_dim + 4
         )
 
     def _prepare_hcu_int8_paged_query(

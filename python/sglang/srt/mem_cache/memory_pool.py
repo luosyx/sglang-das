@@ -4758,10 +4758,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         else:
             assert self.index_page_size == 64
             if self.index_page_size != self.page_size:
-                assert self.index_k_cache_mode is IndexKCacheMode.BF16, (
-                    "Virtual DCP draft pages require the BF16 index-K cache; "
-                    "scaled index-K layouts must match the KV pool page size."
-                )
+                assert self.index_k_cache_mode in (
+                    IndexKCacheMode.BF16, IndexKCacheMode.INT8_SCALED
+                ), "Virtual DCP draft pages support BF16 or INT8 index-K storage"
         self.index_key_cache = self._create_index_key_cache()
         self._initialize_int8_index_k_workspace()
         self._finalize_allocation_log(size)
@@ -5024,7 +5023,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k,
             self.index_key_cache.buffer[cache_index],
             loc,
-            page_size=self.page_size,
+            page_size=self.index_page_size,
             int8_k=int8_k,
             fp32_scales=fp32_scales,
         )
