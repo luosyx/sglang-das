@@ -159,7 +159,8 @@ def test_compressed_tensors_w4a16_is_converted_to_slimquant_layout():
     packed = torch.tensor([[packed]], dtype=torch.int64).to(torch.int32)
 
     name, actual = _convert_compressed_tensors_w4a16_for_slimquant(
-        "model.layers.3.mlp.experts.0.gate_proj.weight_packed", packed
+        "model.layers.3.mlp.experts.0.gate_proj.weight_packed", packed,
+        source_quantization_config={"quant_method": "compressed-tensors"},
     )
 
     assert name.endswith("gate_proj.weight")
@@ -170,6 +171,7 @@ def test_compressed_tensors_w4a16_is_converted_to_slimquant_layout():
     scale_name, scale = _convert_compressed_tensors_w4a16_for_slimquant(
         "model.layers.3.mlp.experts.0.gate_proj.weight_scale",
         torch.tensor([[0.016]], dtype=torch.float32),
+        source_quantization_config={"quant_method": "compressed-tensors"},
     )
     assert scale_name.endswith("gate_proj.weight_scale")
     torch.testing.assert_close(scale, torch.tensor([[0.001]], dtype=torch.float32))
@@ -179,6 +181,19 @@ def test_compressed_tensors_w4a16_shape_metadata_is_skipped():
     name, value = _convert_compressed_tensors_w4a16_for_slimquant(
         "model.layers.3.mlp.experts.0.gate_proj.weight_shape",
         torch.tensor([2048, 6144]),
+        source_quantization_config={"quant_method": "compressed_tensors"},
     )
     assert name is None
     assert value is None
+
+
+def test_native_slimquant_expert_tensors_are_preserved():
+    for prefix in ("model.layers.3", "model.layers.78"):
+        for suffix in ("weight", "weight_scale"):
+            name = f"{prefix}.mlp.experts.0.gate_proj.{suffix}"
+            weight = torch.tensor([[0.016]], dtype=torch.float32)
+            actual_name, actual = _convert_compressed_tensors_w4a16_for_slimquant(
+                name, weight, {"quant_method": "slimquant_w4a8"}
+            )
+            assert actual_name == name
+            assert actual is weight

@@ -85,6 +85,7 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
 def _convert_compressed_tensors_w4a16_for_slimquant(
     name: str,
     loaded_weight: torch.Tensor,
+    source_quantization_config: Optional[dict],
 ) -> Tuple[Optional[str], Optional[torch.Tensor]]:
     """Convert routed-expert W4A16 tensors to the legacy SlimQuant layout.
 
@@ -93,6 +94,14 @@ def _convert_compressed_tensors_w4a16_for_slimquant(
     SlimQuant stores two signed INT4 values per int8, with the even K value in
     the high nibble, and its legacy LightOp kernel expects scale / 16.
     """
+    # The runtime backend also loads native SlimQuant checkpoints, whose
+    # scales already use the kernel convention. Only convert source tensors
+    # explicitly identified as compressed-tensors, including NextN weights.
+    if not source_quantization_config or source_quantization_config.get(
+        "quant_method"
+    ) not in ("compressed-tensors", "compressed_tensors"):
+        return name, loaded_weight
+
     if ".mlp.experts." not in name:
         return name, loaded_weight
 
@@ -328,7 +337,11 @@ class DeepseekV2WeightLoaderMixin:
                 ):
                     name, loaded_weight = (
                         _convert_compressed_tensors_w4a16_for_slimquant(
-                            name, loaded_weight
+                            name,
+                            loaded_weight,
+                            source_quantization_config=getattr(
+                                self.config, "quantization_config", None
+                            ) or getattr(self.config, "compression_config", None),
                         )
                     )
                     if name is None:
