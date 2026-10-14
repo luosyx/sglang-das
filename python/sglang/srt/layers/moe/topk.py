@@ -374,7 +374,8 @@ if _use_lightop_sqrtsoftplus_v41_gate:
 
 
 _use_lightop_moe_gate_pad_int64_fusion = (
-    _use_lightop_sqrtsoftplus_v41_gate
+    _use_lightop
+    and _is_hcu
     and hasattr(op, "moe_fused_gate_sqrtsoftplus_v41_hcu_fused")
 )
 
